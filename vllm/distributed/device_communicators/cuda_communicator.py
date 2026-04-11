@@ -65,6 +65,9 @@ class CudaCommunicator(DeviceCommunicatorBase):
             FlashInferAllReduce,
         )
         from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
+        from vllm.distributed.device_communicators.iris_prefill_experiment import (
+            IrisPrefillExperiment,
+        )
         from vllm.distributed.device_communicators.quick_all_reduce import (
             QuickAllReduce,
         )
@@ -81,6 +84,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
 
         self.ca_comm: CustomAllreduce | None = None
         self.qr_comm: QuickAllReduce | None = None
+        self.iris_prefill_exp: IrisPrefillExperiment | None = None
         self.symm_mem_comm: SymmMemCommunicator | None = None
         self.fi_ar_comm: FlashInferAllReduce | None = None
 
@@ -113,6 +117,10 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 # If it's a rocm, 'use_custom_allreduce==True' means it must
                 # currently be an MI300 series.
                 self.qr_comm = QuickAllReduce(group=self.cpu_group, device=self.device)
+
+                self.iris_prefill_exp = IrisPrefillExperiment(
+                    group=self.cpu_group, device=self.device
+                )
 
         if self.use_all2all:
             if self.all2all_backend == "naive":
@@ -184,6 +192,12 @@ class CudaCommunicator(DeviceCommunicatorBase):
             self.pynccl_comm.world_size, input_
         ):
             out = torch.ops.vllm.all_reduce_symmetric_with_copy(input_)
+            if out is not None:
+                return out
+        # Iris prefill experiment: try before QuickReduce for large tensors
+        iris_exp = self.iris_prefill_exp
+        if iris_exp is not None and not iris_exp.disabled:
+            out = iris_exp.all_reduce(input_)
             if out is not None:
                 return out
         # always try quick reduce first, then flashinfer, then custom allreduce,
@@ -342,6 +356,8 @@ class CudaCommunicator(DeviceCommunicatorBase):
             self.pynccl_comm = None
         if self.ca_comm is not None:
             self.ca_comm = None
+        if self.iris_prefill_exp is not None:
+            self.iris_prefill_exp = None
         if self.fi_ar_comm is not None:
             self.fi_ar_comm.destroy()
             self.fi_ar_comm = None

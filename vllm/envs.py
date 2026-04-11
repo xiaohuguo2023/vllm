@@ -190,6 +190,11 @@ if TYPE_CHECKING:
     ] = "NONE"
     VLLM_ROCM_QUICK_REDUCE_CAST_BF16_TO_FP16: bool = True
     VLLM_ROCM_QUICK_REDUCE_MAX_SIZE_BYTES_MB: int | None = None
+    VLLM_USE_IRIS_PREFILL_EXPERIMENT: bool = False
+    VLLM_IRIS_PREFILL_VARIANT: str = "two_shot"
+    VLLM_IRIS_PREFILL_MIN_BYTES: int = 16 * 1024 * 1024
+    VLLM_IRIS_PREFILL_MAX_BYTES: int = 128 * 1024 * 1024
+    VLLM_IRIS_PREFILL_HEAP_SIZE_MB: int = 2048
     VLLM_NIXL_ABORT_REQUEST_TIMEOUT: int = 480
     VLLM_MORIIO_CONNECTOR_READ_MODE: bool = False
     VLLM_MORIIO_QP_PER_TRANSFER: int = 1
@@ -1028,6 +1033,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # communication.
     "VLLM_ROCM_QUICK_REDUCE_MAX_SIZE_BYTES_MB": lambda: maybe_convert_int(
         os.environ.get("VLLM_ROCM_QUICK_REDUCE_MAX_SIZE_BYTES_MB", None)
+    ),
+    "VLLM_USE_IRIS_PREFILL_EXPERIMENT": lambda: (
+        os.getenv("VLLM_USE_IRIS_PREFILL_EXPERIMENT", "0") in ("1", "true")
+    ),
+    "VLLM_IRIS_PREFILL_VARIANT": lambda: os.getenv(
+        "VLLM_IRIS_PREFILL_VARIANT", "two_shot"
+    ),
+    "VLLM_IRIS_PREFILL_MIN_BYTES": lambda: int(
+        os.getenv("VLLM_IRIS_PREFILL_MIN_BYTES", str(16 * 1024 * 1024))
+    ),
+    "VLLM_IRIS_PREFILL_MAX_BYTES": lambda: int(
+        os.getenv("VLLM_IRIS_PREFILL_MAX_BYTES", str(128 * 1024 * 1024))
+    ),
+    "VLLM_IRIS_PREFILL_HEAP_SIZE_MB": lambda: int(
+        os.getenv("VLLM_IRIS_PREFILL_HEAP_SIZE_MB", "2048")
     ),
     # Divisor for dynamic query scale factor calculation for FP8 KV Cache
     "Q_SCALE_CONSTANT": lambda: int(os.getenv("Q_SCALE_CONSTANT", "200")),
