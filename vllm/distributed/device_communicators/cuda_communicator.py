@@ -65,9 +65,6 @@ class CudaCommunicator(DeviceCommunicatorBase):
             FlashInferAllReduce,
         )
         from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
-        from vllm.distributed.device_communicators.iris_prefill_experiment import (
-            IrisPrefillExperiment,
-        )
         from vllm.distributed.device_communicators.quick_all_reduce import (
             QuickAllReduce,
         )
@@ -84,7 +81,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
 
         self.ca_comm: CustomAllreduce | None = None
         self.qr_comm: QuickAllReduce | None = None
-        self.iris_prefill_exp: IrisPrefillExperiment | None = None
+        self.iris_prefill_exp: "IrisPrefillExperiment | None" = None
         self.symm_mem_comm: SymmMemCommunicator | None = None
         self.fi_ar_comm: FlashInferAllReduce | None = None
 
@@ -111,6 +108,10 @@ class CudaCommunicator(DeviceCommunicatorBase):
             )
 
             if current_platform.is_rocm():
+                from vllm.distributed.device_communicators.iris_prefill_experiment import (  # noqa: E501
+                    IrisPrefillExperiment,
+                )
+
                 # Initialize a custom quick all-reduce implementation for AMD.
                 # Quick reduce is designed as a complement to custom allreduce.
                 # Based on quickreduce (https://github.com/mk1-project/quickreduce).
@@ -194,7 +195,10 @@ class CudaCommunicator(DeviceCommunicatorBase):
             out = torch.ops.vllm.all_reduce_symmetric_with_copy(input_)
             if out is not None:
                 return out
-        # Iris prefill experiment: try before QuickReduce for large tensors
+        # Iris prefill experiment: intercepts tensors in the configured
+        # [min_bytes, max_bytes] range before QuickReduce. Both backends
+        # remain active; Iris handles the large-message range while
+        # QuickReduce covers everything else.
         iris_exp = self.iris_prefill_exp
         if iris_exp is not None and not iris_exp.disabled:
             out = iris_exp.all_reduce(input_)
@@ -357,6 +361,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         if self.ca_comm is not None:
             self.ca_comm = None
         if self.iris_prefill_exp is not None:
+            self.iris_prefill_exp.destroy()
             self.iris_prefill_exp = None
         if self.fi_ar_comm is not None:
             self.fi_ar_comm.destroy()

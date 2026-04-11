@@ -13,6 +13,8 @@ Gated by VLLM_USE_IRIS_PREFILL_EXPERIMENT=1. ROCm + TP8 only.
 
 from __future__ import annotations
 
+from collections import OrderedDict
+
 import torch
 from torch.distributed import ProcessGroup
 
@@ -27,6 +29,7 @@ _REQUIRED_WORLD_SIZE = 8
 
 
 class IrisPrefillExperiment:
+    _MAX_BUF_CACHE_ENTRIES: int = 32
 
     def __init__(
         self,
@@ -117,10 +120,10 @@ class IrisPrefillExperiment:
             all_reduce_distribution=1,
         )
 
-        self._buf_cache: dict[
+        self._buf_cache: OrderedDict[
             tuple[int, int, torch.dtype],
             tuple[torch.Tensor, torch.Tensor, object],
-        ] = {}
+        ] = OrderedDict()
 
         self._claimed_calls: int = 0
         self._claimed_bytes: int = 0
@@ -231,6 +234,7 @@ class IrisPrefillExperiment:
         )
 
         self._buf_cache[(M, N, dtype)] = (input_buf, output_buf, workspace)
+        self._buf_cache.move_to_end((M, N, dtype))
 
         self.shmem.ccl.all_reduce(
             output_buf,
@@ -256,11 +260,14 @@ class IrisPrefillExperiment:
         key = (M, N, dtype)
         cached = self._buf_cache.get(key)
         if cached is not None:
+            self._buf_cache.move_to_end(key)
             return cached
 
         input_buf = self.shmem.zeros((M, N), dtype=dtype)
         output_buf = self.shmem.zeros((M, N), dtype=dtype)
         workspace = None
+        if len(self._buf_cache) >= self._MAX_BUF_CACHE_ENTRIES:
+            self._buf_cache.popitem(last=False)
         self._buf_cache[key] = (input_buf, output_buf, workspace)
         return input_buf, output_buf, workspace
 
@@ -304,13 +311,20 @@ class IrisPrefillExperiment:
     @staticmethod
     def _is_weak_contiguous(inp: torch.Tensor) -> bool:
         return (
-            inp.storage().nbytes() - inp.storage_offset() * inp.element_size()
+            inp.untyped_storage().nbytes() - inp.storage_offset() * inp.element_size()
             == inp.numel() * inp.element_size()
         )
 
-    def __del__(self) -> None:
+    def destroy(self) -> None:
         if hasattr(self, "shmem") and self.shmem is not None:
             try:
                 self.shmem.barrier()
             except Exception:
                 pass
+            self.shmem = None
+        if hasattr(self, "_buf_cache"):
+            self._buf_cache.clear()
+        self.disabled = True
+
+    def __del__(self) -> None:
+        self.destroy()
