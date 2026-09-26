@@ -418,6 +418,18 @@ class AiterMLADecodeMetadata(MLACommonDecodeMetadata):
     use_gluon_verify: bool = False
     # Whether persistent MLA metadata was computed
     has_persistent_metadata: bool = False
+    # FULL decode graphs replay this schedule from the first forward_mqa.
+    # The builder only publishes stable seq-len buffers; the cumsum, page-index
+    # expand, query indptr and get_mla_metadata_v1 are recorded in the graph.
+    schedule_in_forward: bool = False
+    schedule_num_heads: int = 0
+    schedule_causal: bool = True
+    schedule_uni_qo_len: int = -1
+    schedule_uniform_qo: bool = False
+    schedule_q_dtype: torch.dtype | None = None
+    schedule_kv_dtype: object = None
+    schedule_block_size: int = 1
+    paged_kv_indptr_buf: torch.Tensor | None = None
 
 
 @dataclass
@@ -1085,13 +1097,6 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
         # flattens kv_buffer). last_page_len is always 1.
         paged_kv_last_page_len = self.paged_kv_last_page_len[:num_kernel_reqs]
 
-        # indptr: cumsum of seq_lens (one page per token in the flat view)
-        paged_kv_indptr = torch.cat(
-            [
-                torch.zeros(1, dtype=torch.int32, device=device),
-                seq_lens_for_kernel.cumsum(dim=0, dtype=torch.int32),
-            ]
-        )
         use_gluon_decode = AiterMLAHelper.use_gluon_decode(
             self._decode_num_heads,
             int(max_qo_len),
@@ -1109,13 +1114,56 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
         use_segmented_dcp_verify = (
             self._supports_segmented_dcp_verify and max_qo_len > 1
         )
+        # Only the asm decode consumes the schedule, so gate on the routing
+        # rather than on num_heads >= 16, which denies it to a padded rank
+        # running the same asm kernels. The predicates are disjoint -- decode
+        # is qlen==1, verify is qlen>1 -- and cover both Gluon entries plus the
+        # segmented DCP verify.
+        use_persistent_metadata = (
+            not use_gluon_decode
+            and not use_gluon_verify
+            and not use_segmented_dcp_verify
+            # A padded rank has no bf16 persistent kernel past qlen 4 where the
+            # gfx950 fold is absent; the non-persistent entry covers it. fp8
+            # keeps the schedule -- its fold rejects non-persistent outright.
+            # A non-causal block keeps it too: what the fold drops past qlen 4
+            # is the block's causal staircase, which a non-causal block does
+            # not have, and the schedule is the only thing carrying its mask.
+            and (
+                not causal
+                or self._decode_num_heads >= AiterMLAHelper._AITER_MIN_MLA_HEADS
+                or max_qo_len <= AiterMLAHelper._ASM_PADDED_MAX_PS_QLEN
+                or is_quantized_kv_cache(self._kv_cache_dtype_str)
+            )
+            and max_qo_len >= 1
+            and max_qo_len <= self._mtp_decode_qlen
+        )
+        # Record the page-index expand and the MLA schedule in the decode
+        # graph. The builder only publishes the stable seq-len buffer.
+        defer_schedule = (
+            use_persistent_metadata
+            and self.compilation_config.cudagraph_mode.has_full_cudagraphs()
+        )
+        uni_qo_len = (
+            max_qo_len if pad_uniform_mtp or torch.all(qo_len == max_qo_len) else -1
+        )
 
         # Segmented DCP verify carries its own per-row subpage table, so the
         # flat per-token view is dead work for it. Leave the buffer alone and
         # hand the metadata None, so a future reader cannot pick up whatever
         # the previous batch left behind.
         paged_kv_indices = None
-        if not use_segmented_dcp_verify:
+        if defer_schedule:
+            assert self.paged_kv_indptr is not None
+            paged_kv_indptr = self.paged_kv_indptr[: 1 + num_kernel_reqs]
+            paged_kv_indices = self.paged_kv_indices
+        elif not use_segmented_dcp_verify:
+            paged_kv_indptr = torch.cat(
+                [
+                    torch.zeros(1, dtype=torch.int32, device=device),
+                    seq_lens_for_kernel.cumsum(dim=0, dtype=torch.int32),
+                ]
+            )
             if self.compilation_config.cudagraph_mode.has_full_cudagraphs():
                 self.paged_kv_indices.fill_(-1)
 
@@ -1133,8 +1181,23 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
                 BLOCK_SIZE=1024,
             )
             paged_kv_indices = self.paged_kv_indices
+        else:
+            paged_kv_indptr = torch.cat(
+                [
+                    torch.zeros(1, dtype=torch.int32, device=device),
+                    seq_lens_for_kernel.cumsum(dim=0, dtype=torch.int32),
+                ]
+            )
 
-        if self.compilation_config.cudagraph_mode.has_full_cudagraphs():
+        if defer_schedule:
+            qo_indptr = self.qo_indptr[: 1 + num_kernel_reqs]
+            if not (pad_uniform_mtp or max_qo_len == 1):
+                self.qo_indptr[: 1 + num_kernel_reqs].copy_(
+                    query_start_loc_device[: 1 + num_kernel_reqs],
+                    non_blocking=True,
+                )
+                self.qo_indptr[1 + num_kernel_reqs :] = qo_indptr[-1]
+        elif self.compilation_config.cudagraph_mode.has_full_cudagraphs():
             self.paged_kv_indptr[: 1 + num_kernel_reqs].copy_(
                 paged_kv_indptr, non_blocking=True
             )
@@ -1169,31 +1232,6 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
                 else:
                     qo_indptr = query_start_loc_device[: 1 + num_kernel_reqs]
 
-        has_persistent_metadata = False
-        # Only the asm decode consumes the schedule, so gate on the routing
-        # rather than on num_heads >= 16, which denies it to a padded rank
-        # running the same asm kernels. The predicates are disjoint -- decode
-        # is qlen==1, verify is qlen>1 -- and cover both Gluon entries plus the
-        # segmented DCP verify.
-        use_persistent_metadata = (
-            not use_gluon_decode
-            and not use_gluon_verify
-            and not use_segmented_dcp_verify
-            # A padded rank has no bf16 persistent kernel past qlen 4 where the
-            # gfx950 fold is absent; the non-persistent entry covers it. fp8
-            # keeps the schedule -- its fold rejects non-persistent outright.
-            # A non-causal block keeps it too: what the fold drops past qlen 4
-            # is the block's causal staircase, which a non-causal block does
-            # not have, and the schedule is the only thing carrying its mask.
-            and (
-                not causal
-                or self._decode_num_heads >= AiterMLAHelper._AITER_MIN_MLA_HEADS
-                or max_qo_len <= AiterMLAHelper._ASM_PADDED_MAX_PS_QLEN
-                or is_quantized_kv_cache(self._kv_cache_dtype_str)
-            )
-            and max_qo_len >= 1
-            and max_qo_len <= self._mtp_decode_qlen
-        )
         if (
             not causal
             and max_qo_len == 2
@@ -1212,12 +1250,11 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
                 "query block. Pin the draft to TRITON_MLA for this "
                 "speculative config."
             )
-        if use_persistent_metadata:
+        # FULL decode graphs record get_mla_metadata_v1 from the first
+        # forward_mqa. Eager and piecewise paths still schedule here.
+        if use_persistent_metadata and not defer_schedule:
             from aiter import get_mla_metadata_v1
 
-            uni_qo_len = (
-                max_qo_len if pad_uniform_mtp or torch.all(qo_len == max_qo_len) else -1
-            )
             get_mla_metadata_v1(
                 qo_indptr,
                 paged_kv_indptr,
@@ -1239,7 +1276,7 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
                 dtype_q=self._mla_q_dtype,
                 dtype_kv=self._mla_kv_dtype,
             )
-            has_persistent_metadata = True
+        has_persistent_metadata = use_persistent_metadata
 
         # Small-head multi-token verify uses mla_gluon's 4-D MTP entry over the
         # ordinary per-request paged-KV view, so there is no expanded per-token
@@ -1284,6 +1321,15 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
             use_gluon_verify=use_gluon_verify,
             attn_out_dtype=self.decode_attn_out_dtype,
             has_persistent_metadata=has_persistent_metadata,
+            schedule_in_forward=defer_schedule,
+            schedule_num_heads=self._num_attention_heads,
+            schedule_causal=causal,
+            schedule_uni_qo_len=int(uni_qo_len),
+            schedule_uniform_qo=bool(pad_uniform_mtp or max_qo_len == 1),
+            schedule_q_dtype=self._mla_q_dtype,
+            schedule_kv_dtype=self._mla_kv_dtype,
+            schedule_block_size=self.kernel_block_size,
+            paged_kv_indptr_buf=self.paged_kv_indptr if defer_schedule else None,
         )
 
         return attn_metadata
@@ -1953,6 +1999,80 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
             out_dtype,
         )
 
+    def _refresh_decode_schedule(
+        self,
+        decode: AiterMLADecodeMetadata,
+        attn_metadata: AiterMLAMetadata,
+    ) -> None:
+        """Replay the MLA schedule from stable buffers.
+
+        Called from the first layer of a captured decode forward, so the
+        cumsum, the page-index expand, the uniform query indptr and
+        get_mla_metadata_v1 are part of the HIP graph instead of an eager
+        chain before it.
+        """
+        if not decode.schedule_in_forward:
+            return
+        # One schedule per step. Later layers in this forward see the flag
+        # clear; a graph replay never re-enters this Python.
+        decode.schedule_in_forward = False
+        n = decode.seq_lens.shape[0]
+        indptr = decode.paged_kv_indptr_buf
+        assert indptr is not None
+        assert decode.qo_indptr is not None
+        assert decode.max_qo_len is not None
+        # A Python scalar store copies a CPU tensor into the graph and aborts
+        # capture. zero_ / copy_ stay on device.
+        indptr[:1].zero_()
+        torch.cumsum(decode.seq_lens, dim=0, dtype=torch.int32, out=indptr[1 : n + 1])
+        tail = indptr[n + 1 :]
+        if tail.numel():
+            tail.copy_(indptr[n : n + 1].expand_as(tail))
+        kv_indptr = indptr[: n + 1]
+        if decode.schedule_uniform_qo:
+            qlen = int(decode.max_qo_len)
+            torch.arange(
+                0,
+                (n + 1) * qlen,
+                step=qlen,
+                dtype=torch.int32,
+                device=decode.qo_indptr.device,
+                out=decode.qo_indptr,
+            )
+        if decode.paged_kv_indices is not None and decode.block_table is not None:
+            decode.paged_kv_indices.fill_(-1)
+            _expand_page_indices_kernel[(n,)](
+                decode.paged_kv_indices,
+                decode.block_table,
+                decode.block_table.stride(0),
+                kv_indptr,
+                KERNEL_BLOCK_SIZE=decode.schedule_block_size,
+                BLOCK_SIZE=1024,
+            )
+        from aiter import get_mla_metadata_v1
+
+        get_mla_metadata_v1(
+            decode.qo_indptr,
+            kv_indptr,
+            decode.paged_kv_last_page_len,
+            decode.schedule_num_heads,
+            1,
+            decode.schedule_causal,
+            attn_metadata.work_meta_data,
+            attn_metadata.work_info_set,
+            attn_metadata.work_indptr,
+            attn_metadata.reduce_indptr,
+            attn_metadata.reduce_final_map,
+            attn_metadata.reduce_partial_map,
+            page_size=1,
+            kv_granularity=16,
+            max_seqlen_qo=int(decode.max_qo_len),
+            uni_seqlen_qo=decode.schedule_uni_qo_len,
+            fast_mode=True,
+            dtype_q=decode.schedule_q_dtype,
+            dtype_kv=decode.schedule_kv_dtype,
+        )
+
     def forward_mqa(
         self,
         q: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
@@ -1962,6 +2082,8 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         assert kv_c_and_k_pe_cache.numel() > 0
         assert attn_metadata.decode is not None
+        if attn_metadata.decode.schedule_in_forward:
+            self._refresh_decode_schedule(attn_metadata.decode, attn_metadata)
 
         decode = attn_metadata.decode
         assert decode.max_qo_len is not None
