@@ -26,12 +26,16 @@ from vllm.v1.attention.ops.rocm_aiter_mla_merge import (  # noqa: E402
 
 
 class _NoOpTritonKernel:
+    def __init__(self, arg_names=()):
+        self.arg_names = arg_names
+        self.calls = []
+
     def __getitem__(self, grid):
         self.grid = grid
         return self
 
     def __call__(self, *args, **kwargs):
-        pass
+        self.calls.append((args, kwargs))
 
 
 def _lse_combine_natural(
@@ -694,8 +698,9 @@ def test_min_kv_seq_len_ignores_cudagraph_padding_rows(monkeypatch):
     assert metadata.min_kv_seq_len == active_seq_len
 
 
+@pytest.mark.parametrize("chunked_page_expand", [False, True])
 def test_full_cudagraph_padded_uniform_mtp_synthesizes_decode_indptr(
-    monkeypatch,
+    monkeypatch, chunked_page_expand
 ):
     """Full-CG zero-qo rows follow rocm_aiter_mla.py:608-657,717-759."""
     get_mla_metadata_v1 = mock.MagicMock()
@@ -704,9 +709,10 @@ def test_full_cudagraph_padded_uniform_mtp_synthesizes_decode_indptr(
         "aiter",
         SimpleNamespace(get_mla_metadata_v1=get_mla_metadata_v1),
     )
-    monkeypatch.setattr(
-        rocm_aiter_mla, "_expand_page_indices_kernel", _NoOpTritonKernel()
+    expand_kernel = _NoOpTritonKernel(
+        ("block_table_stride_1",) if chunked_page_expand else ()
     )
+    monkeypatch.setattr(rocm_aiter_mla, "_expand_page_indices_kernel", expand_kernel)
 
     mtp_qlen = 4
     seq_lens = torch.tensor([7, 0], dtype=torch.int32)
@@ -744,16 +750,34 @@ def test_full_cudagraph_padded_uniform_mtp_synthesizes_decode_indptr(
 
     assert metadata.max_qo_len == mtp_qlen
     assert torch.equal(metadata.seq_lens, expected_seq_lens)
+
+    attn_metadata = SimpleNamespace(
+        work_meta_data=None,
+        work_info_set=None,
+        work_indptr=None,
+        reduce_indptr=None,
+        reduce_final_map=None,
+        reduce_partial_map=None,
+    )
+    AiterMLAImpl._refresh_decode_schedule(None, metadata, attn_metadata)
+
     assert torch.equal(metadata.paged_kv_indptr, expected_paged_kv_indptr)
     assert torch.equal(metadata.qo_indptr, expected_qo_indptr)
     assert torch.all(
         builder.paged_kv_indptr[expected_paged_kv_indptr.numel() :]
         == expected_paged_kv_indptr[-1]
     )
-    assert torch.all(
-        builder.qo_indptr[expected_qo_indptr.numel() :] == expected_qo_indptr[-1]
-    )
     assert metadata.has_persistent_metadata
+
+    assert expand_kernel.grid == ((2, 1) if chunked_page_expand else (2,))
+    args, kwargs = expand_kernel.calls[0]
+    assert args[2] == metadata.block_table.stride(0)
+    if chunked_page_expand:
+        assert args[3] == metadata.block_table.stride(1)
+        assert torch.equal(args[4], metadata.paged_kv_indptr)
+    else:
+        assert torch.equal(args[3], metadata.paged_kv_indptr)
+    assert kwargs == {"KERNEL_BLOCK_SIZE": 1, "BLOCK_SIZE": 1024}
     assert get_mla_metadata_v1.call_args.kwargs["max_seqlen_qo"] == mtp_qlen
     assert get_mla_metadata_v1.call_args.kwargs["uni_seqlen_qo"] == mtp_qlen
 

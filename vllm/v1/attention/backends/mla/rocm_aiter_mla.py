@@ -2041,14 +2041,29 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
             )
         if decode.paged_kv_indices is not None and decode.block_table is not None:
             decode.paged_kv_indices.fill_(-1)
-            _expand_page_indices_kernel[(n,)](
-                decode.paged_kv_indices,
-                decode.block_table,
-                decode.block_table.stride(0),
-                kv_indptr,
-                KERNEL_BLOCK_SIZE=decode.schedule_block_size,
-                BLOCK_SIZE=1024,
-            )
+            bt = decode.block_table
+            if "block_table_stride_1" in _expand_page_indices_kernel.arg_names:
+                # Chunked kernel from #57978: grid over (request, token chunk).
+                # The width bound is static per captured graph.
+                max_tokens = bt.shape[1] * decode.schedule_block_size
+                _expand_page_indices_kernel[(n, max(1, cdiv(max_tokens, 1024)))](
+                    decode.paged_kv_indices,
+                    bt,
+                    bt.stride(0),
+                    bt.stride(1),
+                    kv_indptr,
+                    KERNEL_BLOCK_SIZE=decode.schedule_block_size,
+                    BLOCK_SIZE=1024,
+                )
+            else:
+                _expand_page_indices_kernel[(n,)](
+                    decode.paged_kv_indices,
+                    bt,
+                    bt.stride(0),
+                    kv_indptr,
+                    KERNEL_BLOCK_SIZE=decode.schedule_block_size,
+                    BLOCK_SIZE=1024,
+                )
         from aiter import get_mla_metadata_v1
 
         get_mla_metadata_v1(
